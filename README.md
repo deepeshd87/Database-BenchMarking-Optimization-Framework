@@ -20,17 +20,17 @@ This creates 'XE_QueryPerformanceMetrics', 'XE_WaitEvents', 'XE_LockContentions'
 
 ### 3. Create the stored procedures
 
-XE_LoadXEQueryPerformance.sql      -- incremental load
-XE_AggregateDailyMetrics.sql       -- daily roll-up
-XE_MaintenanceCleanup.sql          -- 30-day retention
+Optimization_LoadXEQueryPerformance.sql      -- incremental load
+Optimization_AggregateDailyMetrics.sql       -- daily roll-up
+Optimization_CollectXEMetricsScheduled.sql          -- 30-day retention
 
 ### 4. Schedule via SQL Agent
 
 | Job step | Frequency | Procedure |
 |---|---|---|
-| Load XE data | Every 5–15 min | XE_LoadXEQueryPerformance |
-| Daily aggregation | Once at 00:30 UTC | XE_AggregateDailyMetrics |
-| Cleanup + reload | Once at 01:00 UTC | XE_MaintenanceCleanup |
+| Load XE data | Every 5–15 min | Optimization_LoadXEQueryPerformance |
+| Daily aggregation | Once at 00:30 UTC | Optimization_AggregateDailyMetrics |
+| Cleanup + reload | Once at 01:00 UTC | Optimization_CollectXEMetricsScheduled |
 
 ---
 
@@ -71,11 +71,11 @@ Defined in `01_create_event_session.sql`. Defaults:
 
 ### File location
 
-Change 'C:\DatabaseHealth\' in '01_create_event_session.sql' and 'XE_LoadXEQueryPerformance.sql' to point wherever you want the '.xel' files. The folder must exist and be writable by the SQL Server service account.
+Change 'C:\DatabaseHealth\' in 'CreateEventSession' and 'Optimization_LoadXEQueryPerformance.sql' to point wherever you want the '.xel' files. The folder must exist and be writable by the SQL Server service account.
 
 ### Retention
 
-Default is 30 days, defined in `05_usp_MaintenanceCleanup.sql`. The '.xel' files themselves are bounded by 'max_file_size = 100' MB × 'max_rollover_files = 10' ≈ 1 GB on disk.
+Default is 30 days, defined in `Optimization_CollectXEMetricsScheduled`. The '.xel' files themselves are bounded by 'max_file_size = 100' MB × 'max_rollover_files = 10' ≈ 1 GB on disk.
 
 
 ## How the incremental load works (the part worth understanding)
