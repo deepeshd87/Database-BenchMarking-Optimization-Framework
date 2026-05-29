@@ -1,0 +1,230 @@
+CREATE PROCEDURE dbo.Optimization_LoadXEQueryPerformance
+    @DatabaseName NVARCHAR(128) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @LastFile   NVARCHAR(260),
+            @LastOffset BIGINT,
+            @LastSeq    INT,
+            @NewFile    NVARCHAR(260),
+            @NewOffset  BIGINT,
+            @NewSeq     INT,
+            @RowsLoaded INT = 0;
+
+    BEGIN TRY
+        /* ---- 0. Read current watermark ---- */
+        SELECT @LastFile   = LastFileName,
+               @LastOffset = LastFileOffset,
+               @LastSeq    = ISNULL(LastBufferSeq, 0)
+        FROM dbo.XE_LoadWatermark
+        WHERE SessionName = N'CJ_QueryPerformanceMonitoring';
+
+        /* ---- 0a. Rollover-safety: if the watermark file is gone, reset ---- */
+        IF @LastFile IS NOT NULL
+           AND NOT EXISTS (
+                SELECT 1
+                FROM sys.fn_xe_file_target_read_file(
+                    'C:\DatabaseHealth\CJ_QueryPerformanceMonitoring*.xel',
+                    NULL, @LastFile, @LastOffset))
+        BEGIN
+            PRINT 'Watermark file rolled off disk; resetting to start of available data.';
+            UPDATE dbo.XE_LoadWatermark
+               SET LastFileName   = NULL,
+                   LastFileOffset = NULL,
+                   LastBufferSeq  = NULL
+            WHERE SessionName = N'CJ_QueryPerformanceMonitoring';
+
+            SELECT @LastFile = NULL, @LastOffset = NULL, @LastSeq = 0;
+        END
+
+        /* ---- 1. Read .xel and stage everything strictly after the watermark ---- */
+        ;WITH raw AS (
+            SELECT
+                object_name,
+                [file_name],
+                file_offset,
+                CAST(event_data AS XML) AS event_xml,
+                ROW_NUMBER() OVER (
+                    PARTITION BY [file_name], file_offset
+                    ORDER BY (SELECT NULL)
+                ) AS buffer_seq
+            FROM sys.fn_xe_file_target_read_file(
+                'C:\DatabaseHealth\CJ_QueryPerformanceMonitoring*.xel',
+                NULL, @LastFile, @LastOffset)
+        )
+        SELECT
+            object_name,
+            [file_name],
+            file_offset,
+            buffer_seq,
+            event_xml,
+            CAST(event_xml.value('(/event/@timestamp)[1]', 'DATETIME2') AS DATETIME2) AS event_ts
+        INTO #raw
+        FROM raw
+        WHERE @LastFile IS NULL
+           OR [file_name]  >  @LastFile
+           OR ([file_name] =  @LastFile AND file_offset  >  @LastOffset)
+           OR ([file_name] =  @LastFile AND file_offset  =  @LastOffset AND buffer_seq > @LastSeq);
+
+        IF NOT EXISTS (SELECT 1 FROM #raw)
+        BEGIN
+            PRINT 'No new events since last load.';
+            DROP TABLE #raw;
+            RETURN;
+        END
+
+    --    BEGIN TRAN;
+
+            /* ---- 2a. Query metrics: rpc / sp_statement / sql_batch ---- */
+            INSERT INTO dbo.XE_QueryPerformanceMetrics (
+                EventTimeUTC, EventType, DatabaseName, QueryTextHash, QueryPlanHash,
+                QueryText, DurationMS, CPUTimeMS, LogicalReadsPages, PhysicalReadsPages,
+                LogicalWritesPages, RowsAffected, [File_Name], file_offset, BufferSeq
+            )
+            SELECT
+                event_ts,
+                object_name,
+                event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)'),
+                event_xml.value('(/event/action[@name="query_hash"]/value)[1]', 'BINARY(8)'),
+                event_xml.value('(/event/action[@name="query_plan_hash"]/value)[1]', 'BINARY(8)'),
+                COALESCE(
+                    event_xml.value('(/event/data[@name="statement"]/value)[1]', 'NVARCHAR(MAX)'),
+                    event_xml.value('(/event/data[@name="batch_text"]/value)[1]', 'NVARCHAR(MAX)'),
+                    event_xml.value('(/event/action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)')),
+                event_xml.value('(/event/data[@name="duration"]/value)[1]', 'BIGINT') / 1000,
+                event_xml.value('(/event/data[@name="cpu_time"]/value)[1]', 'BIGINT') / 1000,
+                event_xml.value('(/event/data[@name="logical_reads"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="physical_reads"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="writes"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="row_count"]/value)[1]', 'BIGINT'),
+                [file_name],
+                file_offset,
+                buffer_seq
+            FROM #raw
+            WHERE object_name IN ('rpc_completed', 'sp_statement_completed', 'sql_batch_completed')
+              AND (@DatabaseName IS NULL
+                   OR event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)') = @DatabaseName);
+
+            SET @RowsLoaded += @@ROWCOUNT;
+
+            /* ---- 2b. Lock contention: lock_deadlock / lock_timeout ---- */
+            INSERT INTO dbo.XE_LockContentions (
+                EventTimeUTC, EventType, DatabaseName, SessionID, SqlText,
+                [File_Name], file_offset, BufferSeq
+            )
+            SELECT
+                event_ts,
+                object_name,
+                event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)'),
+                event_xml.value('(/event/action[@name="session_id"]/value)[1]', 'INT'),
+                event_xml.value('(/event/action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)'),
+                [file_name],
+                file_offset,
+                buffer_seq
+            FROM #raw
+            WHERE object_name IN ('lock_deadlock', 'lock_timeout');
+
+            SET @RowsLoaded += @@ROWCOUNT;
+
+            /* ---- 2c. Memory spills: hash_warning / sort_warning ---- */
+            INSERT INTO dbo.XE_MemorySpills (
+                EventTimeUTC, SpillType, DatabaseName, SessionID, QueryPlanHash,
+                [File_Name], file_offset, BufferSeq
+            )
+            SELECT
+                event_ts,
+                object_name,
+                event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)'),
+                event_xml.value('(/event/action[@name="session_id"]/value)[1]', 'INT'),
+                event_xml.value('(/event/action[@name="query_plan_hash"]/value)[1]', 'BINARY(8)'),
+                [file_name],
+                file_offset,
+                buffer_seq
+            FROM #raw
+            WHERE object_name IN ('hash_warning', 'sort_warning');
+
+            SET @RowsLoaded += @@ROWCOUNT;
+
+            /* ---- 2d. Wait statistics: sqlos.wait_info ----
+               NOTE: wait_info.duration is in MILLISECONDS — do NOT divide by 1000.
+               wait_type comes through as mapped text under /text, not /value. */
+            INSERT INTO dbo.XE_WaitEvents (
+                EventTimeUTC, WaitType, WaitTimeMS, SignalDurationMS,
+                DatabaseName, SessionID, SqlText,
+                [File_Name], file_offset, BufferSeq
+            )
+            SELECT
+                event_ts,
+                event_xml.value('(/event/data[@name="wait_type"]/text)[1]', 'NVARCHAR(100)'),
+                event_xml.value('(/event/data[@name="duration"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="signal_duration"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)'),
+                event_xml.value('(/event/action[@name="session_id"]/value)[1]', 'INT'),
+                event_xml.value('(/event/action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)'),
+                [file_name],
+                file_offset,
+                buffer_seq
+            FROM #raw
+            WHERE object_name = 'wait_info';
+
+            SET @RowsLoaded += @@ROWCOUNT;
+
+            /* ---- 2e. Memory grants: sqlserver.query_memory_grant_usage ---- */
+            INSERT INTO dbo.XE_MemoryGrants (
+                EventTimeUTC, DatabaseName, SessionID, QueryHash, QueryPlanHash,
+                GrantedMemoryKB, UsedMemoryKB, IdealMemoryKB, SqlText,
+                [File_Name], file_offset, BufferSeq
+            )
+            SELECT
+                event_ts,
+                event_xml.value('(/event/action[@name="database_name"]/value)[1]', 'NVARCHAR(128)'),
+                event_xml.value('(/event/action[@name="session_id"]/value)[1]', 'INT'),
+                event_xml.value('(/event/action[@name="query_hash"]/value)[1]', 'BINARY(8)'),
+                event_xml.value('(/event/action[@name="query_plan_hash"]/value)[1]', 'BINARY(8)'),
+                event_xml.value('(/event/data[@name="granted_memory_kb"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="used_memory_kb"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/data[@name="ideal_memory_kb"]/value)[1]', 'BIGINT'),
+                event_xml.value('(/event/action[@name="sql_text"]/value)[1]', 'NVARCHAR(MAX)'),
+                [file_name],
+                file_offset,
+                buffer_seq
+            FROM #raw
+            WHERE object_name = 'query_memory_grant_usage';
+
+            SET @RowsLoaded += @@ROWCOUNT;
+
+            /* ---- 3. Advance watermark to the last event we just staged ---- */
+            SELECT TOP (1)
+                   @NewFile   = [file_name],
+                   @NewOffset = file_offset,
+                   @NewSeq    = buffer_seq
+            FROM #raw
+            ORDER BY [file_name] DESC, file_offset DESC, buffer_seq DESC;
+
+            UPDATE dbo.XE_LoadWatermark
+               SET LastFileName   = @NewFile,
+                   LastFileOffset = @NewOffset,
+                   LastBufferSeq  = @NewSeq,
+                   LastLoadedUTC  = SYSUTCDATETIME()
+            WHERE SessionName = N'CJ_QueryPerformanceMonitoring';
+
+        COMMIT TRAN;
+
+        DROP TABLE #raw;
+
+        PRINT 'XE load complete. Rows loaded: ' + CAST(@RowsLoaded AS VARCHAR(20))
+            + '. Watermark advanced to ' + ISNULL(@NewFile, '<null>')
+            + ' / offset ' + ISNULL(CAST(@NewOffset AS VARCHAR(20)), '<null>')
+            + ' / seq '    + ISNULL(CAST(@NewSeq AS VARCHAR(10)), '<null>');
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        IF OBJECT_ID('tempdb..#raw') IS NOT NULL DROP TABLE #raw;
+
+        DECLARE @msg NVARCHAR(2048) = 'usp_LoadXEQueryPerformance failed: ' + ERROR_MESSAGE();
+        RAISERROR(@msg, 16, 1);   -- re-raise so SQL Agent job step fails visibly
+    END CATCH
+END
+GO
