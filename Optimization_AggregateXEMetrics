@@ -1,0 +1,118 @@
+CREATE PROCEDURE dbo.Optimization_AggregateXEMetrics
+    @MetricsDate DATE = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+  
+    
+BEGIN TRY
+       SET @MetricsDate = CAST(DATEADD(DAY, -1, SYSUTCDATETIME()) AS DATE);  -- e.g. yesterday
+
+BEGIN TRAN
+;WITH q AS (
+    SELECT *
+    FROM dbo.XE_QueryPerformanceMetrics
+    WHERE CAST(EventTimeUTC AS DATE) = @MetricsDate
+),
+pct AS (
+    SELECT DISTINCT
+        DatabaseName,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY DurationMS)
+            OVER (PARTITION BY DatabaseName) AS P95DurationMS,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY DurationMS)
+            OVER (PARTITION BY DatabaseName) AS P99DurationMS
+    FROM q
+),
+agg AS (
+    SELECT
+        DatabaseName,
+        AVG(CAST(DurationMS AS FLOAT))                     AS AvgDurationMS,
+        MAX(DurationMS)                                    AS MaxDurationMS,
+        SUM(CASE WHEN DurationMS > 1000 THEN 1 ELSE 0 END) AS QueryCountAbove1SecCount,
+        SUM(LogicalReadsPages)                             AS TotalLogicalReads,
+        AVG(CAST(LogicalReadsPages AS FLOAT))             AS AvgLogicalReadsPerQuery,
+        SUM(PhysicalReadsPages)                            AS TotalPhysicalReads
+    FROM q
+    GROUP BY DatabaseName
+),
+-- ===== NEW: wait totals per database =====
+wait_agg AS (
+    SELECT
+        DatabaseName,
+        SUM(WaitTimeMS) AS TotalWaitTimeMS
+    FROM dbo.XE_WaitEvents
+    WHERE CAST(EventTimeUTC AS DATE) = @MetricsDate
+    GROUP BY DatabaseName
+),
+-- ===== NEW: dominant wait type per database (ranked by total wait time) =====
+wait_top AS (
+    SELECT DatabaseName, WaitType
+    FROM (
+        SELECT
+            DatabaseName,
+            WaitType,
+            ROW_NUMBER() OVER (PARTITION BY DatabaseName
+                               ORDER BY SUM(WaitTimeMS) DESC) AS rn
+        FROM dbo.XE_WaitEvents
+        WHERE CAST(EventTimeUTC AS DATE) = @MetricsDate
+        GROUP BY DatabaseName, WaitType
+    ) x
+    WHERE rn = 1
+),
+-- ===== NEW: memory grant stats per database =====
+grant_agg AS (
+    SELECT
+        DatabaseName,
+        AVG(GrantedMemoryKB)                              AS AvgGrantedMemoryKB,
+        MAX(GrantedMemoryKB)                              AS MaxGrantedMemoryKB,
+        AVG(GrantedMemoryKB - ISNULL(UsedMemoryKB, 0))   AS AvgGrantOverageKB,
+        COUNT(*)                                         AS MemoryGrantEvents
+    FROM dbo.XE_MemoryGrants
+    WHERE CAST(EventTimeUTC AS DATE) = @MetricsDate
+    GROUP BY DatabaseName
+)
+INSERT INTO dbo.XE_DailyMetricsAggregated (
+    MetricsDate, DatabaseName, AvgDurationMS, MaxDurationMS,
+    P95DurationMS, P99DurationMS,
+    QueryCountAbove1SecCount, TotalLogicalReads, AvgLogicalReadsPerQuery, TotalPhysicalReads,
+    TopWaitType, TotalWaitTimeMS, LockContentionEvents, MemorySpillEvents,
+    AvgGrantedMemoryKB, MaxGrantedMemoryKB, AvgGrantOverageKB, MemoryGrantEvents
+)
+SELECT
+    @MetricsDate,
+    a.DatabaseName,
+    a.AvgDurationMS,
+    a.MaxDurationMS,
+    p.P95DurationMS,
+    p.P99DurationMS,
+    a.QueryCountAbove1SecCount,
+    a.TotalLogicalReads,
+    a.AvgLogicalReadsPerQuery,
+    a.TotalPhysicalReads,
+    wt.WaitType            AS TopWaitType,         -- now populated
+    wa.TotalWaitTimeMS,                            -- now populated
+    (SELECT COUNT(*) FROM dbo.XE_LockContentions lc
+       WHERE lc.DatabaseName = a.DatabaseName
+         AND CAST(lc.EventTimeUTC AS DATE) = @MetricsDate)  AS LockContentionEvents,
+    (SELECT COUNT(*) FROM dbo.XE_MemorySpills ms
+       WHERE ms.DatabaseName = a.DatabaseName
+         AND CAST(ms.EventTimeUTC AS DATE) = @MetricsDate)  AS MemorySpillEvents,
+    g.AvgGrantedMemoryKB,
+    g.MaxGrantedMemoryKB,
+    g.AvgGrantOverageKB,
+    g.MemoryGrantEvents
+FROM agg a
+LEFT JOIN pct       p  ON p.DatabaseName  = a.DatabaseName
+LEFT JOIN wait_agg  wa ON wa.DatabaseName = a.DatabaseName
+LEFT JOIN wait_top  wt ON wt.DatabaseName = a.DatabaseName
+LEFT JOIN grant_agg g  ON g.DatabaseName  = a.DatabaseName;
+
+PRINT 'Daily metrics aggregated for ' + CONVERT(VARCHAR(10), @MetricsDate, 120);
+COMMIT TRAN
+END TRY
+BEGIN CATCH
+	IF @@TRANCOUNT > 0
+		ROLLBACK
+END CATCH
+END
+GO
