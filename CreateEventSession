@@ -1,0 +1,59 @@
+CREATE EVENT SESSION [CJ_QueryPerformanceMonitoring] ON SERVER
+ADD EVENT sqlserver.rpc_completed (
+    ACTION (sqlserver.database_name, sqlserver.sql_text, sqlserver.query_hash,
+            sqlserver.query_plan_hash, sqlserver.session_id,
+            sqlserver.client_app_name, sqlserver.client_hostname)
+    WHERE ([duration] > 1000 AND [database_id] > 4)
+),
+ADD EVENT sqlserver.sql_batch_completed (
+    SET collect_batch_text = 1
+    ACTION (sqlserver.database_name, sqlserver.sql_text, sqlserver.session_id,
+            sqlserver.query_hash, sqlserver.query_plan_hash)   -- added
+    WHERE ([duration] > 5000)
+),
+ADD EVENT sqlserver.sp_statement_completed (
+    ACTION (sqlserver.database_name, sqlserver.sql_text, sqlserver.session_id,
+            sqlserver.query_hash, sqlserver.query_plan_hash)   -- added
+    WHERE ([duration] > 1000)
+),
+ADD EVENT sqlserver.lock_deadlock (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.sql_text)
+),
+ADD EVENT sqlserver.lock_timeout (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.sql_text)
+),
+ADD EVENT sqlserver.hash_warning (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.query_plan_hash)
+),
+ADD EVENT sqlserver.sort_warning (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.query_plan_hash)
+),
+ADD EVENT sqlserver.execution_warning (
+    ACTION (sqlserver.database_name, sqlserver.session_id)
+),
+-- ===== NEW: wait statistics =====
+ADD EVENT sqlos.wait_info (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.sql_text)
+    WHERE ([opcode] = 1 AND [duration] > 1000)
+),
+-- ===== NEW: memory grants =====
+ADD EVENT sqlserver.query_memory_grant_usage (
+    ACTION (sqlserver.database_name, sqlserver.session_id, sqlserver.sql_text,
+            sqlserver.query_hash, sqlserver.query_plan_hash)
+)
+ADD TARGET package0.event_file (
+    SET filename = N'C:\DatabaseHealth\CJ_QueryPerformanceMonitoring.xel',
+        max_file_size = 100,
+        max_rollover_files = 10
+)
+WITH (
+    MAX_MEMORY = 8 MB,
+    EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
+    MAX_DISPATCH_LATENCY = 10 SECONDS,
+    TRACK_CAUSALITY = ON,
+    STARTUP_STATE = ON
+);
+GO
+
+ALTER EVENT SESSION [CJ_QueryPerformanceMonitoring] ON SERVER STATE = START;
+GO
