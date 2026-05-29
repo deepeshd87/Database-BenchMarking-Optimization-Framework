@@ -1,0 +1,26 @@
+CREATE PROCEDURE dbo.Optimization_CollectXEMetricsScheduled
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+BEGIN TRY
+    -- Parse new XE data (incremental load from the .xel file)
+    EXEC dbo.Optimization_LoadXEQueryPerformance;
+
+    -- Clean up old data (keep last 30 days)
+    DELETE FROM dbo.XE_QueryPerformanceMetrics
+    WHERE EventTimeUTC < DATEADD(DAY, -30, SYSUTCDATETIME());
+
+    DELETE FROM dbo.XE_LockContentions
+    WHERE EventTimeUTC < DATEADD(DAY, -30, SYSUTCDATETIME());
+
+    DELETE FROM dbo.XE_MemorySpills
+    WHERE EventTimeUTC < DATEADD(DAY, -30, SYSUTCDATETIME());
+
+    PRINT 'XE collection scheduled job completed successfully.';
+END TRY
+BEGIN CATCH
+    PRINT 'Error in scheduled collection: ' + ERROR_MESSAGE();
+END CATCH
+END;
+GO
