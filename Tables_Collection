@@ -1,0 +1,115 @@
+CREATE TABLE dbo.XE_LoadWatermark (
+    SessionName    SYSNAME       NOT NULL PRIMARY KEY,
+    LastFileName   NVARCHAR(260) NULL,
+    LastFileOffset BIGINT        NULL,
+    LastLoadedUTC  DATETIME2(3)  NULL,
+	LastBufferSeq INT NULL
+);
+INSERT INTO dbo.XE_LoadWatermark (SessionName) VALUES (N'CJ_QueryPerformanceMonitoring');
+
+CREATE TABLE dbo.XE_QueryPerformanceMetrics (
+    XEId               BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTimeUTC       DATETIME2(3)  NOT NULL,
+    EventType          NVARCHAR(60)  NOT NULL,
+    DatabaseName       NVARCHAR(128) NULL,
+    QueryTextHash      BINARY(8)     NULL,
+    QueryPlanHash      BINARY(8)     NULL,
+    QueryText          NVARCHAR(MAX) NULL,
+    DurationMS         BIGINT        NULL,
+    CPUTimeMS          BIGINT        NULL,
+    LogicalReadsPages  BIGINT        NULL,
+    PhysicalReadsPages BIGINT        NULL,
+    LogicalWritesPages BIGINT        NULL,
+    RowsAffected       BIGINT        NULL,
+    [File_Name]        NVARCHAR(260) NOT NULL,
+    file_offset        BIGINT        NOT NULL,
+    BufferSeq INT NULL
+);
+
+CREATE TABLE dbo.XE_LockContentions (
+    XEId           BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTimeUTC   DATETIME2(3)  NOT NULL,
+    EventType      NVARCHAR(60)  NOT NULL,
+    DatabaseName   NVARCHAR(128) NULL,
+    SessionID      INT           NULL,
+    SqlText        NVARCHAR(MAX) NULL,
+    [File_Name]    NVARCHAR(260) NOT NULL,
+    file_offset    BIGINT        NOT NULL,
+    BufferSeq INT NULL
+);
+
+CREATE TABLE dbo.XE_MemorySpills (
+    XEId           BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTimeUTC   DATETIME2(3)  NOT NULL,
+    SpillType      NVARCHAR(60)  NOT NULL,
+    DatabaseName   NVARCHAR(128) NULL,
+    SessionID      INT           NULL,
+    QueryPlanHash  BINARY(8)     NULL,
+    [File_Name]    NVARCHAR(260) NOT NULL,
+    file_offset    BIGINT        NOT NULL,
+    BufferSeq INT NULL
+);
+
+CREATE TABLE dbo.XE_WaitEvents (
+    XEId           BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTimeUTC   DATETIME2(3)  NOT NULL,
+    WaitType       NVARCHAR(100) NULL,
+    WaitTimeMS     BIGINT        NULL,   -- already ms from the event
+    SignalDurationMS BIGINT      NULL,
+    DatabaseName   NVARCHAR(128) NULL,
+    SessionID      INT           NULL,
+    SqlText        NVARCHAR(MAX) NULL,
+    [File_Name]    NVARCHAR(260) NOT NULL,
+    file_offset    BIGINT        NOT NULL,
+    BufferSeq INT NULL
+);
+
+CREATE TABLE dbo.XE_MemoryGrants (
+    XEId             BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTimeUTC     DATETIME2(3)  NOT NULL,
+    DatabaseName     NVARCHAR(128) NULL,
+    SessionID        INT           NULL,
+    QueryHash        BINARY(8)     NULL,
+    QueryPlanHash    BINARY(8)     NULL,
+    GrantedMemoryKB  BIGINT        NULL,
+    UsedMemoryKB     BIGINT        NULL,
+    IdealMemoryKB    BIGINT        NULL,
+    SqlText          NVARCHAR(MAX) NULL,
+    [File_Name]      NVARCHAR(260) NOT NULL,
+    file_offset      BIGINT        NOT NULL,
+    BufferSeq INT NULL
+);
+
+CREATE TABLE dbo.XE_DailyMetricsAggregated (
+    AggregateID BIGINT PRIMARY KEY IDENTITY(1,1),
+    MetricsDate DATE NOT NULL,
+    DatabaseName NVARCHAR(128),
+    
+    -- Query performance
+    AvgDurationMS FLOAT,
+    MaxDurationMS BIGINT,
+    P95DurationMS FLOAT,
+    P99DurationMS FLOAT,
+    QueryCountAbove1SecCount INT,          -- Queries taking >1s
+    
+    -- I/O
+    TotalLogicalReads BIGINT,
+    AvgLogicalReadsPerQuery FLOAT,
+    TotalPhysicalReads BIGINT,
+    
+    -- Wait events
+    TopWaitType NVARCHAR(100),
+    TotalWaitTimeMS BIGINT,
+    
+    -- Lock contention
+    LockContentionEvents INT,
+    AverageBlockingTimeMS FLOAT,
+    
+    -- Memory
+    TotalMemoryUsedMB BIGINT,
+    MemorySpillEvents INT,
+	AvgGrantedMemoryKB   BIGINT NULL,
+    MaxGrantedMemoryKB   BIGINT NULL,
+    AvgGrantOverageKB    BIGINT NULL,   -- granted minus used (wasted grant)
+    MemoryGrantEvents    INT    NULL
+);
