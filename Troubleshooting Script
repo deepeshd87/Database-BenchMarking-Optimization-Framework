@@ -1,0 +1,485 @@
+/* ====================================================================
+   CJ_QueryPerformanceMonitoring — Full Performance Dashboard
+   Run against the database where the XE_* tables live.
+   ==================================================================== */
+
+SET NOCOUNT ON;
+SET ANSI_WARNINGS ON;
+
+-- Optional: scope to one database for sections that support it (NULL = all)
+DECLARE @DatabaseName NVARCHAR(128) = NULL;
+
+
+/* ====================================================================
+   1. REAL-TIME OVERVIEW — LAST HOUR AT A GLANCE
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '1. REAL-TIME OVERVIEW (Last Hour)';
+PRINT '========================================================';
+
+SELECT
+    (SELECT COUNT(*) FROM dbo.XE_QueryPerformanceMetrics
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME()))           AS QueryEvents_1h,
+    (SELECT COUNT(*) FROM dbo.XE_QueryPerformanceMetrics
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+          AND DurationMS > 1000)                                              AS SlowQueries_1h,
+    (SELECT COUNT(*) FROM dbo.XE_WaitEvents
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME()))           AS WaitEvents_1h,
+    (SELECT COUNT(*) FROM dbo.XE_LockContentions
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+          AND EventType = 'lock_deadlock')                                    AS Deadlocks_1h,
+    (SELECT COUNT(*) FROM dbo.XE_LockContentions
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+          AND EventType = 'lock_timeout')                                     AS LockTimeouts_1h,
+    (SELECT COUNT(*) FROM dbo.XE_MemorySpills
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME()))           AS SpillEvents_1h,
+    (SELECT COUNT(*) FROM dbo.XE_MemoryGrants
+        WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME()))           AS GrantEvents_1h;
+
+
+/* ====================================================================
+   2. SLOW QUERY DETECTIVE WORK
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '2a. TOP 50 SLOW QUERIES (Last Hour, with severity)';
+PRINT '========================================================';
+
+SELECT TOP 50
+    EventTimeUTC,
+    EventType,
+    DatabaseName,
+    DurationMS,
+    CPUTimeMS,
+    LogicalReadsPages,
+    PhysicalReadsPages,
+    RowsAffected,
+    CASE
+        WHEN DurationMS > 30000 THEN 'CATASTROPHIC'
+        WHEN DurationMS > 5000  THEN 'CRITICAL'
+        WHEN DurationMS > 1000  THEN 'HIGH'
+        WHEN DurationMS > 100   THEN 'MEDIUM'
+        ELSE 'LOW'
+    END AS Severity,
+    CASE
+        WHEN LogicalReadsPages > 100000 THEN 'EXTREME_IO'
+        WHEN LogicalReadsPages > 10000  THEN 'HIGH_IO'
+        WHEN LogicalReadsPages > 1000   THEN 'MEDIUM_IO'
+        ELSE 'LOW_IO'
+    END AS IOClass,
+    LEFT(QueryText, 200) AS QueryPreview
+FROM dbo.XE_QueryPerformanceMetrics
+WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+ORDER BY DurationMS DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '2b. WORST RECURRING QUERIES (Last 24h, by total time)';
+PRINT '========================================================';
+
+SELECT TOP 20
+    QueryTextHash,
+    COUNT(*)                  AS Executions,
+    SUM(DurationMS)           AS TotalDurationMS,
+    AVG(DurationMS)           AS AvgDurationMS,
+    MAX(DurationMS)           AS MaxDurationMS,
+    AVG(LogicalReadsPages)    AS AvgLogicalReads,
+    MAX(LogicalReadsPages)    AS MaxLogicalReads,
+    MAX(LEFT(QueryText, 300)) AS SampleQueryText
+FROM dbo.XE_QueryPerformanceMetrics
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND QueryTextHash IS NOT NULL
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY QueryTextHash
+ORDER BY SUM(DurationMS) DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '2c. PER-DATABASE PERFORMANCE DISTRIBUTION WITH PERCENTILES (Last Hour)';
+PRINT '========================================================';
+
+;WITH q AS (
+    SELECT *
+    FROM dbo.XE_QueryPerformanceMetrics
+    WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+      AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+),
+pct AS (
+    SELECT DISTINCT
+        DatabaseName,
+        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY DurationMS)
+            OVER (PARTITION BY DatabaseName) AS P50,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY DurationMS)
+            OVER (PARTITION BY DatabaseName) AS P95,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY DurationMS)
+            OVER (PARTITION BY DatabaseName) AS P99
+    FROM q
+),
+agg AS (
+    SELECT DatabaseName,
+           COUNT(*)                                            AS QueryCount,
+           AVG(CAST(DurationMS AS FLOAT))                     AS AvgMS,
+           MAX(DurationMS)                                    AS MaxMS,
+           SUM(CASE WHEN DurationMS > 1000 THEN 1 ELSE 0 END) AS SlowCount
+    FROM q
+    GROUP BY DatabaseName
+)
+SELECT a.DatabaseName, a.QueryCount, a.AvgMS, p.P50, p.P95, p.P99, a.MaxMS, a.SlowCount
+FROM agg a LEFT JOIN pct p ON p.DatabaseName = a.DatabaseName
+ORDER BY p.P95 DESC;
+
+
+/* ====================================================================
+   3. WAIT ANALYSIS — WHERE IS TIME BEING SPENT
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '3a. TOP 10 WAIT TYPES (Last Hour)';
+PRINT '========================================================';
+
+SELECT TOP 10
+    WaitType,
+    COUNT(*)               AS Occurrences,
+    SUM(WaitTimeMS)        AS TotalWaitMS,
+    AVG(WaitTimeMS)        AS AvgWaitMS,
+    MAX(WaitTimeMS)        AS MaxWaitMS,
+    SUM(SignalDurationMS)  AS TotalSignalMS,
+    CAST(SUM(SignalDurationMS) * 100.0
+         / NULLIF(SUM(WaitTimeMS), 0) AS DECIMAL(5,2)) AS SignalPct
+FROM dbo.XE_WaitEvents
+WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY WaitType
+ORDER BY TotalWaitMS DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '3b. WAIT CATEGORIZATION (I/O vs CPU vs Lock vs Memory)';
+PRINT '========================================================';
+
+;WITH categorized AS (
+    SELECT
+        CASE
+            WHEN WaitType LIKE 'PAGEIOLATCH%'        THEN 'Disk I/O'
+            WHEN WaitType LIKE 'WRITELOG'            THEN 'Log I/O'
+            WHEN WaitType LIKE 'IO_COMPLETION'       THEN 'Other I/O'
+            WHEN WaitType LIKE 'ASYNC_NETWORK_IO'    THEN 'Network/Client'
+            WHEN WaitType LIKE 'LCK[_]%'             THEN 'Locking'
+            WHEN WaitType LIKE 'LATCH[_]%'           THEN 'Latch'
+            WHEN WaitType LIKE 'PAGELATCH%'          THEN 'PageLatch (tempdb/hot page)'
+            WHEN WaitType LIKE 'CXPACKET'
+              OR WaitType LIKE 'CXCONSUMER'          THEN 'Parallelism'
+            WHEN WaitType LIKE 'SOS_SCHEDULER_YIELD' THEN 'CPU'
+            WHEN WaitType LIKE 'THREADPOOL'          THEN 'Worker exhaustion'
+            WHEN WaitType LIKE 'RESOURCE_SEMAPHORE%' THEN 'Memory grant'
+            WHEN WaitType LIKE 'MEMORY%'             THEN 'Memory'
+            ELSE 'Other'
+        END AS Category,
+        WaitTimeMS
+    FROM dbo.XE_WaitEvents
+    WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+      AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+)
+SELECT Category,
+       COUNT(*)        AS WaitEvents,
+       SUM(WaitTimeMS) AS TotalWaitMS
+FROM categorized
+GROUP BY Category
+ORDER BY TotalWaitMS DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '3c. WAIT HOTSPOTS BY DATABASE (Last Hour)';
+PRINT '========================================================';
+
+SELECT TOP 25
+    DatabaseName,
+    WaitType,
+    COUNT(*)        AS Occurrences,
+    SUM(WaitTimeMS) AS TotalWaitMS,
+    AVG(WaitTimeMS) AS AvgWaitMS
+FROM dbo.XE_WaitEvents
+WHERE EventTimeUTC >= DATEADD(HOUR, -1, SYSUTCDATETIME())
+  AND DatabaseName IS NOT NULL
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DatabaseName, WaitType
+ORDER BY TotalWaitMS DESC;
+
+
+/* ====================================================================
+   4. LOCK CONTENTION
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '4a. DEADLOCKS vs TIMEOUTS BREAKDOWN (Last 24h)';
+PRINT '========================================================';
+
+SELECT
+    DatabaseName,
+    EventType,
+    COUNT(*)                  AS Events,
+    COUNT(DISTINCT SessionID) AS DistinctSessions,
+    MIN(EventTimeUTC)         AS FirstSeen,
+    MAX(EventTimeUTC)         AS LastSeen
+FROM dbo.XE_LockContentions
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DatabaseName, EventType
+ORDER BY Events DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '4b. RECENT LOCK EVENTS WITH OFFENDING SQL (Last 24h)';
+PRINT '========================================================';
+
+SELECT TOP 50
+    EventTimeUTC,
+    EventType,
+    DatabaseName,
+    SessionID,
+    LEFT(SqlText, 300) AS SqlPreview
+FROM dbo.XE_LockContentions
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+ORDER BY EventTimeUTC DESC;
+
+
+/* ====================================================================
+   5. MEMORY: SPILLS AND GRANTS
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '5a. SPILL SUMMARY (Last 24h)';
+PRINT '========================================================';
+
+SELECT
+    DatabaseName,
+    SpillType,
+    COUNT(*)                       AS SpillEvents,
+    COUNT(DISTINCT QueryPlanHash)  AS DistinctPlans
+FROM dbo.XE_MemorySpills
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DatabaseName, SpillType
+ORDER BY SpillEvents DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '5b. OVER-GRANTED QUERIES — granted >> used (Last 24h)';
+PRINT '========================================================';
+
+SELECT TOP 25
+    DatabaseName,
+    QueryHash,
+    COUNT(*)                                              AS Executions,
+    AVG(GrantedMemoryKB)                                  AS AvgGrantedKB,
+    AVG(UsedMemoryKB)                                     AS AvgUsedKB,
+    AVG(GrantedMemoryKB - ISNULL(UsedMemoryKB, 0))        AS AvgWastedKB,
+    AVG(IdealMemoryKB)                                    AS AvgIdealKB,
+    CAST(AVG(CAST(UsedMemoryKB AS FLOAT))
+        * 100.0 / NULLIF(AVG(CAST(GrantedMemoryKB AS FLOAT)), 0) AS DECIMAL(5,2)) AS GrantUtilizationPct,
+    MAX(LEFT(SqlText, 200))                               AS SampleSql
+FROM dbo.XE_MemoryGrants
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND GrantedMemoryKB > 0
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DatabaseName, QueryHash
+HAVING COUNT(*) >= 5
+   AND AVG(CAST(UsedMemoryKB AS FLOAT))
+        / NULLIF(AVG(CAST(GrantedMemoryKB AS FLOAT)), 0) < 0.25
+ORDER BY AVG(GrantedMemoryKB - ISNULL(UsedMemoryKB, 0)) * COUNT(*) DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '5c. UNDER-GRANTED QUERIES — ideal >> granted (Last 24h)';
+PRINT '========================================================';
+
+SELECT TOP 25
+    DatabaseName,
+    QueryHash,
+    COUNT(*)                              AS Executions,
+    AVG(GrantedMemoryKB)                  AS AvgGrantedKB,
+    AVG(IdealMemoryKB)                    AS AvgIdealKB,
+    AVG(IdealMemoryKB - GrantedMemoryKB)  AS AvgShortfallKB,
+    MAX(LEFT(SqlText, 200))               AS SampleSql
+FROM dbo.XE_MemoryGrants
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND IdealMemoryKB > GrantedMemoryKB * 2
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DatabaseName, QueryHash
+ORDER BY AVG(IdealMemoryKB - GrantedMemoryKB) * COUNT(*) DESC;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '5d. SPILLS CORRELATED WITH GRANTS (Last 24h)';
+PRINT '========================================================';
+
+SELECT
+    s.DatabaseName,
+    s.SpillType,
+    s.QueryPlanHash,
+    COUNT(*) AS SpillCount,
+    (SELECT AVG(GrantedMemoryKB) FROM dbo.XE_MemoryGrants g
+       WHERE g.QueryPlanHash = s.QueryPlanHash
+         AND g.EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())) AS AvgGrantedKB,
+    (SELECT AVG(IdealMemoryKB) FROM dbo.XE_MemoryGrants g
+       WHERE g.QueryPlanHash = s.QueryPlanHash
+         AND g.EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())) AS AvgIdealKB
+FROM dbo.XE_MemorySpills s
+WHERE s.EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR s.DatabaseName = @DatabaseName)
+GROUP BY s.DatabaseName, s.SpillType, s.QueryPlanHash
+ORDER BY SpillCount DESC;
+
+
+/* ====================================================================
+   6. TREND ANALYSIS — WHEN DID THINGS GO WRONG
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '6a. HOURLY SLOW-QUERY TREND (Last 24h)';
+PRINT '========================================================';
+
+SELECT
+    DATEADD(HOUR, DATEDIFF(HOUR, 0, EventTimeUTC), 0)  AS HourBucket,
+    COUNT(*)                                            AS QueryEvents,
+    SUM(CASE WHEN DurationMS > 1000 THEN 1 ELSE 0 END)  AS Slow_1s,
+    SUM(CASE WHEN DurationMS > 5000 THEN 1 ELSE 0 END)  AS Slow_5s,
+    AVG(CAST(DurationMS AS FLOAT))                      AS AvgDurationMS,
+    MAX(DurationMS)                                     AS MaxDurationMS
+FROM dbo.XE_QueryPerformanceMetrics
+WHERE EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME())
+  AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+GROUP BY DATEADD(HOUR, DATEDIFF(HOUR, 0, EventTimeUTC), 0)
+ORDER BY HourBucket;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '6b. MULTI-SIGNAL HOURLY CORRELATION (Last 24h)';
+PRINT '========================================================';
+
+;WITH hours AS (
+    SELECT DATEADD(HOUR, -n, DATEADD(HOUR, DATEDIFF(HOUR, 0, SYSUTCDATETIME()), 0)) AS HourBucket
+    FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),
+                 (12),(13),(14),(15),(16),(17),(18),(19),(20),(21),(22),(23)) v(n)
+)
+SELECT
+    h.HourBucket,
+    (SELECT COUNT(*) FROM dbo.XE_QueryPerformanceMetrics m
+       WHERE m.EventTimeUTC >= h.HourBucket
+         AND m.EventTimeUTC <  DATEADD(HOUR, 1, h.HourBucket)
+         AND m.DurationMS > 1000
+         AND (@DatabaseName IS NULL OR m.DatabaseName = @DatabaseName))      AS SlowQueries,
+    (SELECT SUM(WaitTimeMS) FROM dbo.XE_WaitEvents w
+       WHERE w.EventTimeUTC >= h.HourBucket
+         AND w.EventTimeUTC <  DATEADD(HOUR, 1, h.HourBucket)
+         AND (@DatabaseName IS NULL OR w.DatabaseName = @DatabaseName))      AS TotalWaitMS,
+    (SELECT COUNT(*) FROM dbo.XE_LockContentions l
+       WHERE l.EventTimeUTC >= h.HourBucket
+         AND l.EventTimeUTC <  DATEADD(HOUR, 1, h.HourBucket)
+         AND (@DatabaseName IS NULL OR l.DatabaseName = @DatabaseName))      AS LockEvents,
+    (SELECT COUNT(*) FROM dbo.XE_MemorySpills s
+       WHERE s.EventTimeUTC >= h.HourBucket
+         AND s.EventTimeUTC <  DATEADD(HOUR, 1, h.HourBucket)
+         AND (@DatabaseName IS NULL OR s.DatabaseName = @DatabaseName))      AS Spills
+FROM hours h
+ORDER BY h.HourBucket;
+
+
+/* ====================================================================
+   7. PLAN REGRESSION DETECTION — same query getting slower
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '7. PLAN REGRESSIONS — Last hour > 2x Last 7d average';
+PRINT '========================================================';
+
+;WITH bins AS (
+    SELECT
+        QueryTextHash,
+        CASE
+            WHEN EventTimeUTC >= DATEADD(HOUR, -1,  SYSUTCDATETIME()) THEN 'Last1h'
+            WHEN EventTimeUTC >= DATEADD(HOUR, -24, SYSUTCDATETIME()) THEN 'Last24h'
+            WHEN EventTimeUTC >= DATEADD(DAY,  -7,  SYSUTCDATETIME()) THEN 'Last7d'
+        END AS Bucket,
+        DurationMS
+    FROM dbo.XE_QueryPerformanceMetrics
+    WHERE QueryTextHash IS NOT NULL
+      AND EventTimeUTC >= DATEADD(DAY, -7, SYSUTCDATETIME())
+      AND (@DatabaseName IS NULL OR DatabaseName = @DatabaseName)
+)
+SELECT
+    QueryTextHash,
+    AVG(CASE WHEN Bucket = 'Last7d'  THEN CAST(DurationMS AS FLOAT) END) AS Avg7d,
+    AVG(CASE WHEN Bucket = 'Last24h' THEN CAST(DurationMS AS FLOAT) END) AS Avg24h,
+    AVG(CASE WHEN Bucket = 'Last1h'  THEN CAST(DurationMS AS FLOAT) END) AS Avg1h,
+    COUNT(CASE WHEN Bucket = 'Last1h' THEN 1 END)                        AS Exec1h
+FROM bins
+GROUP BY QueryTextHash
+HAVING AVG(CASE WHEN Bucket = 'Last1h' THEN CAST(DurationMS AS FLOAT) END)
+     > AVG(CASE WHEN Bucket = 'Last7d' THEN CAST(DurationMS AS FLOAT) END) * 2
+   AND COUNT(CASE WHEN Bucket = 'Last1h' THEN 1 END) >= 5
+ORDER BY (AVG(CASE WHEN Bucket = 'Last1h' THEN CAST(DurationMS AS FLOAT) END)
+        / NULLIF(AVG(CASE WHEN Bucket = 'Last7d' THEN CAST(DurationMS AS FLOAT) END), 0)) DESC;
+
+
+/* ====================================================================
+   8. HEALTH-CHECK INFRASTRUCTURE
+   ==================================================================== */
+PRINT '';
+PRINT '========================================================';
+PRINT '8a. WATERMARK / COLLECTION HEALTH';
+PRINT '========================================================';
+
+SELECT
+    SessionName,
+    LastFileName,
+    LastFileOffset,
+    LastBufferSeq,
+    LastLoadedUTC,
+    DATEDIFF(MINUTE, LastLoadedUTC, SYSUTCDATETIME()) AS MinutesSinceLoad
+FROM dbo.XE_LoadWatermark;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '8b. PER-TABLE ROW COUNTS AND TIME RANGE';
+PRINT '========================================================';
+
+SELECT 'XE_QueryPerformanceMetrics' AS TableName,
+       COUNT(*) AS Rows_, MIN(EventTimeUTC) AS Earliest, MAX(EventTimeUTC) AS Latest
+FROM dbo.XE_QueryPerformanceMetrics
+UNION ALL SELECT 'XE_WaitEvents',      COUNT(*), MIN(EventTimeUTC), MAX(EventTimeUTC) FROM dbo.XE_WaitEvents
+UNION ALL SELECT 'XE_LockContentions', COUNT(*), MIN(EventTimeUTC), MAX(EventTimeUTC) FROM dbo.XE_LockContentions
+UNION ALL SELECT 'XE_MemorySpills',    COUNT(*), MIN(EventTimeUTC), MAX(EventTimeUTC) FROM dbo.XE_MemorySpills
+UNION ALL SELECT 'XE_MemoryGrants',    COUNT(*), MIN(EventTimeUTC), MAX(EventTimeUTC) FROM dbo.XE_MemoryGrants
+ORDER BY TableName;
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT '8c. XE SESSION RUNNING STATUS';
+PRINT '========================================================';
+
+SELECT s.name, s.create_time, t.target_name,
+       CAST(t.target_data AS XML).value('(EventFileTarget/File/@name)[1]', 'NVARCHAR(260)') AS CurrentFile
+FROM sys.dm_xe_sessions s
+JOIN sys.dm_xe_session_targets t ON t.event_session_address = s.address
+WHERE s.name = 'CJ_QueryPerformanceMonitoring';
+
+
+PRINT '';
+PRINT '========================================================';
+PRINT 'Dashboard complete.';
+PRINT '========================================================';
